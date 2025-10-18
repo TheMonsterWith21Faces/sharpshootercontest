@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Sharpshooter Contest</title>
+<link href="https://fonts.googleapis.com/css2?family=Bokor&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#222; --panel:#333; --ink:#eee; --muted:#a7a7a7; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:'Bokor', cursive; }
+  .wrap { display:flex; min-height:100vh; }
+  .ui { width:340px; padding:16px; background:var(--panel); border-right:2px solid #444; }
+  .ui img.logo { display:block; width:260px; margin:0 auto 12px; }
+  .ui label { display:block; margin:10px 0; }
+  .ui input[type=number]{ width:90px; padding:4px; }
+  .row { display:grid; grid-template-columns:1fr; gap:8px; }
+  .btn { display:block; width:100%; margin:8px 0; padding:10px 12px; border:0; border-radius:6px; background:#444; color:var(--ink); cursor:pointer; }
+  .btn:hover { background:#555; }
+  .status { margin-top:8px; font-size:1.05rem; color:var(--muted); }
+  .canvas-box { flex:1; position:relative; display:flex; align-items:center; justify-content:center; padding:16px; }
+  canvas { width:min(90vmin,720px); height:min(90vmin,720px); border:2px solid #555; background:#111; }
+  .overlay { position:absolute; top:10px; left:10px; background:rgba(0,0,0,.6); padding:6px 10px; border-radius:6px; font-size:1.1rem; }
+  dialog { border:1px solid #555; background:#2b2b2b; color:var(--ink); padding:16px; border-radius:8px; }
+  dialog .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  dialog .actions { margin-top:12px; display:flex; gap:8px; justify-content:flex-end; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <aside class="ui">
+    <img class="logo" src="assets/logo.png" alt="logo">
+
+    <label>Dex mod (−5 to +5): <input id="dex" type="number" value="0" min="-5" max="5"></label>
+    <label><input id="prof" type="checkbox"> Bow Proficiency (+1.5)</label>
+    <label><input id="arch" type="checkbox"> Archery Style (+1.5)</label>
+    <label><input id="enableSound" type="checkbox" checked> Enable sound</label>
+
+    <div class="row">
+      <button class="btn" id="shootBtn">Shoot!</button>
+      <button class="btn" id="newRoundBtn">New Round</button>
+      <button class="btn" id="popBtn">Pop Out</button>
+      <button class="btn" id="settingsBtn">Settings</button>
+    </div>
+
+    <div class="status" id="turnStatus">Turn: Player • Shot 1 of 3</div>
+    <div class="status" id="scoreStatus">Player 0 — 0 Rival</div>
+    <div class="status" id="lastScore">Score: —</div>
+  </aside>
+
+  <main class="canvas-box">
+    <canvas id="board" width="700" height="700"></canvas>
+    <div class="overlay" id="overlay">—</div>
+  </main>
+</div>
+
+<!-- hidden assets -->
+<img id="targetImg" src="assets/target.png" style="display:none" alt="">
+<img id="arrowBmp"  src="assets/arrow.png"  style="display:none" alt="">
+
+<!-- settings -->
+<dialog id="settingsDlg">
+  <h3>Settings</h3>
+  <div class="row">
+    <label>Round length (shots per side): <input id="roundLen" type="number" min="1" max="12" value="3"></label>
+    <label><input id="rivalEnabled" type="checkbox" checked> Enable Rival (contest mode)</label>
+  </div>
+  <hr>
+  <strong>Rival skill</strong>
+  <div class="row">
+    <label>Dex mod: <input id="npcDex" type="number" min="-5" max="5" value="2"></label>
+    <label><input id="npcProf" type="checkbox" checked> Proficiency (+1.5)</label>
+    <label><input id="npcArch" type="checkbox"> Archery Style (+1.5)</label>
+  </div>
+  <div class="actions">
+    <button id="settingsClose" class="btn">Close</button>
+    <button id="settingsReset" class="btn">Reset Round</button>
+  </div>
+</dialog>
+
+<script>
+/* ---------------- helpers & state ---------------- */
+const $ = (id)=>document.getElementById(id);
+const canvas = $('board'), ctx = canvas.getContext('2d');
+const targetImg=$('targetImg'), arrowBmp=$('arrowBmp');
+const overlay=$('overlay'), lastScoreEl=$('lastScore'), scoreStatus=$('scoreStatus'), turnStatus=$('turnStatus');
+
+const dexEl=$('dex'), profEl=$('prof'), archEl=$('arch'), enableSoundEl=$('enableSound');
+const shootBtn=$('shootBtn'), newRoundBtn=$('newRoundBtn'), popBtn=$('popBtn');
+const settingsBtn=$('settingsBtn'), dlg=$('settingsDlg');
+const roundLenEl=$('roundLen'), rivalEnabledEl=$('rivalEnabled'),
+      npcDexEl=$('npcDex'), npcProfEl=$('npcProf'), npcArchEl=$('npcArch');
+
+function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+function whenLoaded(img){ return img.complete ? Promise.resolve() : new Promise(r=>{ img.onload=img.onerror=r; }); }
+
+/* ---- sound: fresh Audio each time ---- */
+const SOUND_SRC = {
+  hit: 'assets/shoothit.wav',
+  miss: 'assets/shootmiss.wav',
+  good:'assets/good.wav',
+  bad: 'assets/bad.wav',
+  great:'assets/great.wav',
+  win: 'assets/win.wav',
+  lose:'assets/lose.wav'
+};
+function play(name){
+  if(!enableSoundEl.checked) return;
+  const src = SOUND_SRC[name]; if(!src) return;
+  try { const a=new Audio(src); a.play().catch(()=>{}); } catch(e){}
+}
+
+/* ---- scoring rings: inner micro-bull added ----
+   scores: 100 (inner), 50, 25, 15, 10, 0
+   radii are fractions of the *outer target radius* */
+const PTS  = [100, 50, 25, 15, 10, 0];
+const RADF = [0.03, 0.06, 0.14, 0.23, 0.32, 0.41];
+
+/* ---- locked calibration (APPLIED TO DRAWN TARGET CENTER) ---- */
+const CAL = { x: -7, y: -9, scale: 1.00 };
+
+/* ---- state ---- */
+let shotsPerSide=+roundLenEl.value;
+let shots=[], total={player:0,npc:0}, shotCount={player:0,npc:0}, turn='player';
+let popWin=null;
+
+/* ---- tinted arrow cache ---- */
+const arrowCache = {};
+function tintedArrow(color, size){
+  const key = color+'|'+size;
+  if(arrowCache[key]) return arrowCache[key];
+  const c = document.createElement('canvas'); c.width=c.height=size;
+  const g = c.getContext('2d');
+  g.drawImage(arrowBmp,0,0,size,size);
+  g.globalCompositeOperation='source-atop';
+  g.fillStyle=color; g.fillRect(0,0,size,size);
+  g.globalCompositeOperation='source-over';
+  return arrowCache[key]=c;
+}
+
+/* ---------------- target geometry (THE FIX) ----------------
+   Compute where the PNG actually got drawn and derive center+radius. */
+function getTargetGeom(w=canvas.width, h=canvas.height){
+  // contain-fit the image just like draw
+  const ratio = (targetImg.width||1)/(targetImg.height||1);
+  let tw=w, th=tw/ratio; if(th>h){ th=h; tw=th*ratio; }
+  const ox=(w-tw)/2, oy=(h-th)/2;
+
+  // center is drawn center plus locked offsets
+  const cx = ox + tw/2 + CAL.x;
+  const cy = oy + th/2 + CAL.y;
+
+  // outer radius = half the smaller drawn dimension, with locked scale
+  const R = Math.min(tw, th)/2 * CAL.scale;
+
+  return {ox,oy,tw,th,cx,cy,R};
+}
+
+/* ---------------- drawing ---------------- */
+function drawBoard(ctxRef=ctx,w=canvas.width,h=canvas.height){
+  ctxRef.clearRect(0,0,w,h);
+
+  const g = getTargetGeom(w,h);
+  ctxRef.drawImage(targetImg, g.ox, g.oy, g.tw, g.th);
+
+  // draw arrows with tip at (x,y)
+  shots.forEach(sh=>{
+    const ang=Math.atan2(sh.y-g.cy, sh.x-g.cx);
+    const size=Math.floor(Math.min(w,h)*0.05);
+    ctxRef.save();
+    ctxRef.translate(sh.x,sh.y);
+    ctxRef.rotate(ang);
+    const color = (sh.who==='player') ? '#a86bff' : '#ff4b4b'; // purple / red
+    if(arrowBmp.complete && arrowBmp.naturalWidth>0){
+      ctxRef.drawImage(tintedArrow(color, size), -size, -size, size, size);
+    } else {
+      ctxRef.strokeStyle=color; ctxRef.fillStyle=color; ctxRef.lineWidth=2;
+      ctxRef.beginPath(); ctxRef.moveTo(-size*0.6,0); ctxRef.lineTo(size*0.2,0); ctxRef.stroke();
+      ctxRef.beginPath(); ctxRef.moveTo(size*0.2,0); ctxRef.lineTo(0,-size*0.25); ctxRef.lineTo(0,size*0.25); ctxRef.closePath(); ctxRef.fill();
+    }
+    ctxRef.restore();
+  });
+}
+
+function scoreAt(x,y,w=canvas.width,h=canvas.height){
+  // distance from the drawn target center (with your locked offsets)
+  const g = getTargetGeom(w,h);
+  const d = Math.hypot(x-g.cx, y-g.cy);
+  for(let i=0;i<RADF.length;i++) if(d <= RADF[i]*g.R) return PTS[i];
+  return 0;
+}
+
+/* ---------------- gameplay ---------------- */
+function rivalEnabled(){ return rivalEnabledEl.checked; }
+
+function shootOne(who){
+  if(who==='player' && turn!=='player') return;
+
+  const skill = (()=> {
+    const dex  = (who==='player') ? clamp(+dexEl.value,-5,5) : clamp(+npcDexEl.value,-5,5);
+    const prof = (who==='player') ? (profEl.checked?1.5:0)   : (npcProfEl.checked?1.5:0);
+    const arch = (who==='player') ? (archEl.checked?1.5:0)   : (npcArchEl.checked?1.5:0);
+    return dex+prof+arch;
+  })();
+
+  const MAX_GROUP=Math.min(canvas.width,canvas.height)*0.45;
+  const grouping = skill>=0 ? MAX_GROUP*Math.exp(-0.45*skill) : MAX_GROUP*(1+Math.abs(skill)*0.40);
+  const nat=Math.floor(Math.random()*20)+1;
+  const baseR=((20-nat)/19)*grouping;
+  const jitter=(Math.random()-0.5)*grouping*(skill<=0?0.50:0.10);
+  const theta=Math.random()*Math.PI*2;
+
+  const x = canvas.width/2 + Math.cos(theta)*(baseR+jitter);
+  const y = canvas.height/2 + Math.sin(theta)*(baseR+jitter);
+  const pts=scoreAt(x,y);
+
+  shots.push({x,y,pts,who});
+
+  if(pts>0) play('hit'); else play('miss');
+  if(pts===100) play('great'); else if(pts>30) play('good'); else if(pts>0) play('bad');
+
+  total[who]+=pts; shotCount[who]++;
+  overlay.textContent=`${pts} pts`;
+  lastScoreEl.textContent=`Score: ${pts}`;
+
+  drawBoard(); if(popWin && !popWin.closed) updatePop();
+  updateRoundFlow();
+}
+
+function updateRoundFlow(){
+  if(!rivalEnabled()){
+    scoreStatus.textContent=`Player ${total.player} (practice)`;
+    if(shotCount.player>=shotsPerSide){ turnStatus.textContent='Practice complete — New Round to restart'; shootBtn.disabled=true; return; }
+    turn='player'; shootBtn.disabled=false;
+    turnStatus.textContent=`Turn: Player • Shot ${shotCount.player+1} of ${shotsPerSide}`;
+    return;
+  }
+
+  scoreStatus.textContent=`Player ${total.player} — ${total.npc} Rival`;
+
+  if(shotCount.player>=shotsPerSide && shotCount.npc>=shotsPerSide){
+    const result = total.player===total.npc ? 'Tie' : (total.player>total.npc?'You win!':'You lose!');
+    play(total.player>total.npc?'win':(total.player<total.npc?'lose':null));
+    turnStatus.textContent=`Round over — ${result}`;
+    shootBtn.disabled=true; return;
+  }
+
+  if(turn==='player'){
+    turn='npc'; shootBtn.disabled=true;
+    turnStatus.textContent=`Turn: Rival • Shot ${shotCount.npc+1} of ${shotsPerSide}`;
+    setTimeout(()=>{ shootOne('npc'); shootBtn.disabled=false;
+      if(!(shotCount.player>=shotsPerSide && shotCount.npc>=shotsPerSide)){
+        turn='player';
+        turnStatus.textContent=`Turn: Player • Shot ${shotCount.player+1} of ${shotsPerSide}`;
+      }
+    }, 600);
+  } else {
+    turn='player'; shootBtn.disabled=false;
+    turnStatus.textContent=`Turn: Player • Shot ${shotCount[player]+1} of ${shotsPerSide}`;
+  }
+}
+
+/* ---------------- pop-out ---------------- */
+function popHtml(){
+  return `
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Sharpshooter View</title>
+<link href="https://fonts.googleapis.com/css2?family=Bokor&display=swap" rel="stylesheet">
+<style>
+  body{margin:0;background:#222;color:#eee;font-family:'Bokor',cursive;text-align:center}
+  #sc{margin:8px 0 0;font-size:1.2rem}
+  canvas{border:2px solid #555;margin:10px auto;display:block;width:640px;height:640px;max-width:96vw;max-height:96vw}
+</style></head><body>
+  <div id="sc">—</div>
+  <img id="timg" src="assets/target.png" style="display:none">
+  <img id="abmp" src="assets/arrow.png" style="display:none">
+  <canvas id="pc" width="700" height="700"></canvas>
+</body></html>`;
+}
+function updatePop(){
+  const d=popWin.document, c=d.getElementById('pc'), pctx=c.getContext('2d');
+  const timg=d.getElementById('timg'), abmp=d.getElementById('abmp');
+
+  // draw target (same geometry math)
+  pctx.clearRect(0,0,c.width,c.height);
+  const ratio=(timg.width||1)/(timg.height||1);
+  let tw=c.width, th=tw/ratio; if(th>c.height){ th=c.height; tw=th*ratio; }
+  const ox=(c.width-tw)/2, oy=(c.height-th)/2;
+  pctx.drawImage(timg,ox,oy,tw,th);
+
+  // draw arrows with the same color logic
+  const cx = ox+tw/2 + CAL.x;
+  const cy = oy+th/2 + CAL.y;
+  shots.forEach(sh=>{
+    const ang=Math.atan2(sh.y-cy, sh.x-cx);
+    const size=Math.floor(Math.min(c.width,c.height)*0.05);
+    pctx.save(); pctx.translate(sh.x,sh.y); pctx.rotate(ang);
+    const oc = d.createElement('canvas'); oc.width=oc.height=size;
+    const og = oc.getContext('2d'); og.drawImage(abmp,0,0,size,size);
+    og.globalCompositeOperation='source-atop';
+    og.fillStyle = (sh.who==='player') ? '#a86bff' : '#ff4b4b';
+    og.fillRect(0,0,size,size);
+    og.globalCompositeOperation='source-over';
+    pctx.drawImage(oc,-size,-size,size,size);
+    pctx.restore();
+  });
+
+  d.getElementById('sc').textContent = rivalEnabled()
+    ? `Player ${total.player} — ${total.npc} Rival`
+    : `Player ${total.player} (practice)`;
+}
+
+/* ---------------- round/reset/init ---------------- */
+function resetRound(){
+  shotsPerSide=+roundLenEl.value || 3;
+  shots=[]; total={player:0,npc:0}; shotCount={player:0,npc:0}; turn='player';
+  overlay.textContent='—'; lastScoreEl.textContent='Score: —';
+  scoreStatus.textContent = rivalEnabled() ? 'Player 0 — 0 Rival' : 'Player 0 (practice)';
+  turnStatus.textContent = `Turn: Player • Shot 1 of ${shotsPerSide}`;
+  shootBtn.disabled=false;
+  drawBoard(); if(popWin && !popWin.closed) updatePop();
+}
+
+async function init(){ await Promise.all([whenLoaded(targetImg), whenLoaded(arrowBmp)]); resetRound(); }
+
+shootBtn.addEventListener('click', ()=> shootOne('player'));
+newRoundBtn.addEventListener('click', resetRound);
+
+popBtn.addEventListener('click', ()=>{
+  if(popWin && !popWin.closed){ popWin.focus(); updatePop(); return; }
+  popWin = window.open('', 'SharpshooterPop', 'width=760,height=820');
+  popWin.document.write(popHtml());
+  popWin.document.close();
+  setTimeout(updatePop, 200);
+});
+
+settingsBtn.addEventListener('click', ()=>dlg.showModal());
+$('settingsClose').addEventListener('click', ()=>dlg.close());
+$('settingsReset').addEventListener('click', ()=>{ dlg.close(); resetRound(); });
+
+['change','input'].forEach(ev=>{
+  rivalEnabledEl.addEventListener(ev, resetRound);
+  roundLenEl.addEventListener(ev, resetRound);
+});
+
+init();
+</script>
+
+</body>
+</html>
